@@ -21,10 +21,12 @@ using ENet;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using UnityEngine;
 using UnityAsync;
 using Event = ENet.Event;
 using EventType = ENet.EventType;
+using Open.Nat;
 
 namespace Mirror.Transport
 {
@@ -150,12 +152,14 @@ namespace Mirror.Transport
         public event Action<int, Exception> OnServerError;
         public event Action<int> OnServerDisconnect;
 
+        private static bool forwarded;
 
         // -- INITIALIZATION -- // 
         private readonly string address;
         private readonly ushort port;
         private readonly ushort maxConnections;
         private readonly bool enableCompression;
+        private readonly bool useUPnP;
 
         /// <summary>
         /// Initializes transport
@@ -164,12 +168,13 @@ namespace Mirror.Transport
         /// <param name="port">Server port</param>
         /// <param name="maxConnections">Connection limit (can't be higher than 4095)</param>
         /// <param name="enableCompression">Should packets be comressed with LZ4 compression. Default false.</param>
-        public IgnoranceTransport(string address, ushort port, ushort maxConnections, bool enableCompression = false)
+        public IgnoranceTransport(string address, ushort port, ushort maxConnections, bool enableCompression = false, bool useUPnP = false)
         {
             this.address = address;
             this.port = port;
             this.maxConnections = maxConnections;
             this.enableCompression = enableCompression;
+            this.useUPnP = useUPnP;
 
             Log($"Thank you for using Ignorance Transport v{TransportVersion} for Mirror 2018! Report bugs and donate coffee at https://github.com/SoftwareGuy/Ignorance. \nENET Library Version: {Library.version}");
 
@@ -184,13 +189,14 @@ namespace Mirror.Transport
         /// <param name="maxConnections">Connection limit (can't be higher than 4095)</param>
         /// <param name="channelTypes">Channel list (specifies channel types). Element 0 is used in all Mirror code</param>
         /// <param name="enableCompression">Should packets be comressed with LZ4 compression. Default false.</param>
-        public IgnoranceTransport(string address, ushort port, ushort maxConnections, IEnumerable<PacketFlags> channelTypes, bool enableCompression = false)
+        public IgnoranceTransport(string address, ushort port, ushort maxConnections, IEnumerable<PacketFlags> channelTypes, bool enableCompression = false, bool useUPnP = false)
         {
             this.address = address;
             this.port = port;
             this.maxConnections = maxConnections;
             packetSendMethods = channelTypes.ToArray();
             this.enableCompression = enableCompression;
+            this.useUPnP = useUPnP;
 
             Log($"Thank you for using Ignorance Transport v{TransportVersion} for Mirror 2018! Report bugs and donate coffee at https://github.com/SoftwareGuy/Ignorance. \nENET Library Version: {Library.version}");
 
@@ -382,6 +388,8 @@ namespace Mirror.Transport
                 serverAddress.SetHost(address);
             }
 
+            if (useUPnP && !forwarded) ForwardPort(port);
+
             serverAddress.Port = port;
 
             // Finally create the server.
@@ -496,6 +504,42 @@ namespace Mirror.Transport
             return false;
         }
 
+        private static async void ForwardPort(ushort port)
+        {
+            try
+            {
+                NatDevice device;
+                using (CancellationTokenSource cts = new CancellationTokenSource(10000))
+                {
+                    device = await new NatDiscoverer().DiscoverDeviceAsync(PortMapper.Upnp, cts);
+                }
+
+                await device.CreatePortMapAsync(new Mapping(Open.Nat.Protocol.Udp, port, port, "Ignorance UPnP"));
+            }
+            catch (Exception ex)
+            {
+                LogError($"UPnP failed: {ex}");
+            }
+        }
+
+        private static async void UnForwardPorts()
+        {
+            try
+            {
+                NatDevice device;
+                using (CancellationTokenSource cts = new CancellationTokenSource(10000))
+                {
+                    device = await new NatDiscoverer().DiscoverDeviceAsync(PortMapper.Upnp, cts);
+                }
+
+                device.ReleaseAll();
+            }
+            catch (Exception ex)
+            {
+                LogError($"UPnP disabling failed: {ex}");
+            }
+        }
+
         public virtual bool GetConnectionInfo(int connectionId, out string addressoutput)
         {
             addressoutput = "(invalid)";
@@ -539,8 +583,12 @@ namespace Mirror.Transport
             {
                 server.Flush();
                 server.Dispose();
+                if (forwarded)
+                {
+                    UnForwardPorts();
+                    forwarded = false;
+                }
             }
-
             Library.Deinitialize();
 
             Log("Ignorance Transport: Shutdown complete.");
